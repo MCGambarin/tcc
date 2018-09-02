@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 import _pickle as pkl
 from sklearn.model_selection import GridSearchCV
 from sklearn.neural_network import MLPRegressor
@@ -9,7 +10,6 @@ from sklearn.preprocessing import StandardScaler, MinMaxScaler
 
 
 #Configuração
-from xdg.Menu import sort
 
 pd.set_option('display.max_columns', 100)
 
@@ -20,7 +20,6 @@ cols_scouts = cols_scouts_def + cols_scouts_atk
 scouts_weights = np.array([-2.0, -5.0, 3.0, 7.0, -0.5, -6.0, -2.0, 1.7, 5.0, 5.0, 1.0, 0.7, 0.5, 3.5, 8.0, -0.5, -0.3, -3.5])
 
 ROUND_TO_PREDICT = 38
-
 
 df = pd.read_csv('./data/dados_agregados.csv')
 print(df.shape)
@@ -145,16 +144,14 @@ df_scouts.head()
 df_scouts.drop_duplicates(subset=['AtletaID', 'ano']+cols_scouts, keep='first', inplace=True)
 
 print("Dimensões dos dados após toda a limpeza de dados: ", df_scouts.shape)
-df_scouts.to_csv('../../data/dados_agregados_limpos.csv', index=False)
+df_scouts.to_csv('./data/dados_agregados_limpos.csv', index=False)
 
 
 #Criação das amostras
 
-df_samples = pd.read_csv('../../data/dados_agregados_limpos.csv')
+df_samples = pd.read_csv('./data/dados_agregados_limpos.csv')
 print("Dados para amostra", df_samples.shape)
 df_samples.head()
-
-print("TESTESADASDASDASDASs")
 
 
 # seleciona somente as colunas de interesse para usar como atributos
@@ -183,4 +180,97 @@ df_samples['ClubeID'] = df_samples['ClubeID'].map(dict_teams(to_int=True))
 df_samples['Posicao'] = df_samples['Posicao'].map(dict_positions(to_int=True))
 df_samples['variable'] = df_samples['variable'].map({'home.team':1, 'away.team':2})
 df_samples.head()
+
+
+df_samples.to_csv('./data/dados_agregados_amostras.csv', index=False)
+
+# Treinamento do modelo utilizando Redes Neurais Artificais, apenas com dados de 2017.
+
+df_samples = pd.read_csv('./data/dados_agregados_amostras.csv')
+df_samples = df_samples[df_samples.ano == 2017]
+print(df_samples.shape)
+df_samples.head()
+
+
+def create_samples(df, round_train, round_pred):
+    '''Create a Dataframe with players from round_train, but with 'Pontos' of round_pred'''
+    df_train = df[df['Rodada'] == round_train]
+    df_pred = df[df['Rodada'] == round_pred][['AtletaID', 'Pontos']]
+    df_merge = df_train.merge(df_pred, on='AtletaID', suffixes=['_train', '_pred'])
+
+    df_merge = df_merge.rename(columns={'Pontos_train': 'Pontos', 'Pontos_pred': 'pred'})
+
+    return df_merge
+
+df_train = pd.DataFrame(data=[], columns=list(df_samples.columns) + ['pred'])
+n_rounds = df_samples['Rodada'].max()
+
+for round_train, round_pred in zip(range(1, n_rounds), range(2, n_rounds + 1)):
+    df_round = create_samples(df_samples, round_train, round_pred)
+    print('qtde. de jogadores que participaram na rodada {0:=2} (train) e na rodada {1:=2} (pred): {2:=4}'.format(
+        round_train, round_pred, df_round.shape[0]))
+    df_train = df_train.append(df_round, ignore_index=True)
+
+print("Dimensões dos dados de treinamento: ", df_train.shape)
+
+
+import warnings
+warnings.filterwarnings("ignore")
+
+samples = df_train[df_train.columns.difference(['AtletaID', 'Rodada','pred'])].values.astype(np.float64)
+scores  = df_train['pred'].values
+print(samples.shape, scores.shape)
+
+steps = [('MinMax', MinMaxScaler()), ('NN', MLPRegressor(solver='adam', activation='identity', learning_rate_init=1e-2, momentum=0.9, max_iter=2000))]
+pipe = Pipeline(steps)
+params = dict(NN__hidden_layer_sizes=[(50,50,50,50), (50,100,50), (50,100,100,50)])
+
+reg = GridSearchCV(pipe, params, scoring='neg_mean_squared_error', n_jobs=-1, cv=5, verbose=10)
+reg.fit(samples, scores)
+print(reg.best_params_, reg.best_score_)
+
+scores_pred = reg.predict(samples)
+
+plt.figure(figsize=(16,6))
+plt.plot(range(scores.shape[0]), scores, color='blue')
+plt.plot(range(scores_pred.shape[0]), scores_pred, color='red')
+
+pkl.dump(reg, open('./modelo/nn1.pkl', 'wb'), -1)
+
+# Predições - Carregar modelo treinado e dizer melhores jogadores para uma próxima rodada.
+
+df_test = pd.read_csv('./data/dados_agregados_limpos.csv')
+df_test = df_test[df_test.ano == 2017]
+reg = pkl.load(open('./modelo/nn1.pkl', 'rb'))
+
+
+def to_samples(df):
+    df_samples = df[cols_info+cols_of_interest].copy()
+    df_samples['ClubeID'] = df_samples['ClubeID'].map(dict_teams(to_int=True))
+    df_samples['Posicao'] = df_samples['Posicao'].map(dict_positions(to_int=True))
+    df_samples['variable'] = df_samples['variable'].map({'home.team':1, 'away.team':2})
+    df_samples.reset_index(drop=True, inplace=True)
+    return df_samples
+
+def predict_best_players(df_samples, reg, n_players=11):
+    samples = df_samples[df_samples.columns.difference(['AtletaID', 'Rodada', 'ano'])].values.astype(np.float64)
+
+    pred = reg.predict(samples)
+    best_indexes = pred.argsort()[-n_players:]
+    return df_samples.iloc[best_indexes]
+
+def predict_best_players_by_position(df_samples, reg, n_gol=5, n_zag=5, n_lat=5, n_mei=5, n_atk=5):
+    df_result = pd.DataFrame(columns=df_samples.columns)
+    for n_players, pos in zip([n_gol, n_zag, n_lat, n_mei, n_atk], range(1, 6)):
+        samples = df_samples[df_samples['Posicao'] == pos]
+        df_pos = predict_best_players(samples, reg, n_players)
+        df_result = df_result.append(df_pos)
+
+    return df_result
+
+df_rodada = df_test[(df_test['Rodada'] == (ROUND_TO_PREDICT-1)) & (df_test['Status'] == "Provável")]
+df_samples = to_samples(df_rodada)
+print(df_samples.shape)
+
+
 
